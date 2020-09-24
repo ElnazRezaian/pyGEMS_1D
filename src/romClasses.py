@@ -51,63 +51,6 @@ class solutionROM:
 			except:
 				raise ValueError("ROM IC input dimensions did not match expected dimensions")
 
-		# normalization/centering profiles
-		# TODO: make this a function
-		onesProf = np.ones(sol.solPrim.shape, dtype=realType)
-
-		try: 
-			normSubIn = romDict["normSubIn"]
-			if (type(normSubIn) == list):
-				assert(len(normSubIn) == sol.solPrim.shape[-1])
-				normSubVals = np.arrray(normSubIn, dtype=realType)		# load normalization subtraction values from user input
-				self.normSubProf = onesProf * normSubVals
-			elif (type(normSubIn) == str):
-				self.normSubProf = np.load(os.path.join(self.modelDir, normSubIn))				# load normalization subtraction profile from file
-				assert(self.normSubProf.shape == sol.solPrim.shape)
-		except:
-			print("WARNING: normSubIn load failed or not specified, defaulting to zeros...")
-			self.normSubProf = np.zeros(sol.solPrim.shape, dtype=realType)
-
-		try: 
-			normFacIn = romDict["normFacIn"]
-			if (type(normFacIn) == list):
-				assert(len(normFacIn) == sol.solPrim.shape[-1])
-				normFacVals = np.array(normFacIn, dtype=realType)		# load normalization division values from user input 
-				self.normFacProf = onesProf * normFacVals
-			elif (type(normFacIn) == str):
-				self.normFacProf = np.load(os.path.join(self.modelDir, normFacIn))				# load normalization division profile from file
-				assert(self.normFacProf.shape == sol.solPrim.shape)
-		except:
-			print("WARNING: normFacIn load failed or not specified, defaulting to ones...")
-			self.normSubProf = np.ones(sol.solPrim.shape, dtype=realType)
-
-		try: 
-			centIn = romDict["centIn"]
-			if (type(centIn) == list):
-				assert(len(centIn) == sol.solPrim.shape[-1])
-				centVals = np.array(centIn, dtype=realType)		# load centering values from user input
-				self.centProf = onesProf * centVals
-			elif (type(centIn) == str):
-				self.centProf = np.load(os.path.join(self.modelDir, centIn))					# load centering profile from file
-				assert(self.centProf.shape == sol.solPrim.shape)
-		except:
-			print("WARNING: centIn load failed or not specified, defaulting to zeros...")
-			self.normSubProf = np.zeros(sol.solPrim.shape, dtype=realType)
-
-		# nonlinear models are stored in separate files, linear basis is not
-		try: 
-			assert(len(self.latentDims) == self.numModels)
-		except:
-			raise AssertionError("Incorrect number of latent dimension entries")
-
-		try:
-			if (self.romMethod == "nonlinear"):
-				assert(len(self.modelNames) == self.numModels)
-			elif (self.romMethod == "linear"):
-				assert(type(self.modelNames) == str)
-		except:
-			raise AssertionError("Incorrect number/type of model names")
-
 		# load linear basis for distributing to models
 		if (self.romMethod == "linear"):
 			linearBasis = np.load(os.path.join(self.modelDir, self.modelNames+".npy"))
@@ -119,6 +62,11 @@ class solutionROM:
 		self.solPrim 	= sol.solPrim
 		self.RHS 		= sol.RHS 			
 		
+		# normalization/centering profiles
+		self.normSubProf = self.loadStandardization(romDict["normSubIn"])
+		self.normFacProf = self.loadStandardization(romDict["normFacIn"])
+		self.centProf = self.loadStandardization(romDict["centIn"])
+
 		# model/code associated with each decoder
 		self.code 			= []
 		self.decoderList 	= []
@@ -131,6 +79,37 @@ class solutionROM:
 				self.decoderList.append(model(modelID, self))
 				if self.encoderApprox:
 					self.encoderList.append(model(modelID, self, encoderFlag=True))
+
+		# nonlinear models are stored in separate files, linear basis is not
+		try:
+			assert(len(self.latentDims) == self.numModels)
+		except:
+			raise AssertionError("Incorrect number of latent dimension entries")
+
+		try:
+			if (self.romMethod == "nonlinear"):
+				assert(len(self.modelNames) == self.numModels)
+			elif (self.romMethod == "linear"):
+				assert(type(self.modelNames) == str)
+		except:
+			raise AssertionError("Incorrect number/type of model names")
+
+
+	def loadStandardization(self, dataIn):
+		solShape = self.solPrim.shape
+		try:
+			if (type(dataIn) == list):
+				assert(len(dataIn) == solShape[-1])
+				standVals = np.array(dataIn, dtype=realType)		# load normalization subtraction values from user input
+				standProf = np.ones(solShape, dtype=realType) * standVals
+			elif (type(dataIn) == str):
+				standProf = np.load(os.path.join(self.modelDir, dataIn))				# load normalization subtraction profile from file
+				assert(standProf.shape == solShape)
+		except:
+			print("WARNING: normSubIn load failed or not specified, defaulting to zeros...")
+			standProf = np.zeros(solShape, dtype=realType)
+
+		return standProf
 
 	# initialize code and solution, if required 
 	def initializeROMState(self, sol: solutionPhys):
