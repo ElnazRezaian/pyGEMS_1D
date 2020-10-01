@@ -5,6 +5,7 @@ from scipy.sparse import csc_matrix, bsr_matrix, block_diag
 from stateFuncs import calcCpMixture, calcGasConstantMixture, calcStateFromPrim, calcGammaMixture
 import constants
 from spaceSchemes import calcInvFlux, calcViscFlux, calcSource, reconstruct_2nd, calcRoeDissipation, calcRHS
+import tensorflow as tf
 from matplotlib.pyplot import spy
 import copy
 import pdb
@@ -422,6 +423,25 @@ def calcDResDSolPrimImag(sol: solutionPhys, gas: gasProps, geom: geometry, param
 	
 	return diff
 
+
+# compute analytical gradients of TensorFlow-Keras models
+# TODO: add casting to same dtype as network
+# TODO: would love to have a type hint for modelObj, but right now that's a circular dependency
+def calcAnalyticalTFJacobian(modelObj, encoder = False, dtype = constants.realType):
+
+	if encoder:
+		raise ValueError("Analytical encoder Jacobian has not been implemented")
+	else:
+		with tf.GradientTape() as g:
+			inputs = tf.Variable(modelObj.code[None,:], dtype=dtype)
+			outputs = modelObj.decoder(inputs)
+
+		# output of model is in CW order, Jacobian is thus CWK, reorder to WCK 
+		modelObj.modelJacob = np.transpose(np.squeeze(g.jacobian(outputs, inputs).numpy()), axes=(1,0,2))
+
+# compute numerical gradients of TensorFlow-Keras models
+# TODO: add casting to same dtype as network
+# def calcNumericalTFJacobian():
 
 ### Miscellaneous ###   
 # TODO: move these a different module

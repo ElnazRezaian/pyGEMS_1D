@@ -1,30 +1,43 @@
 import os
 import numpy as np
 from inputFuncs import readInputFile
-from classDefs import parameters, catchInput
+from classDefs import parameters, gasProps, catchInput
 from solution import solutionPhys
-import constants
 from constants import realType
-# import tensorflow as tf 
-# from tensorflow.keras.models import load_model
+from Jacobians import calcAnalyticalTFJacobian
+import tensorflow as tf 
+from tensorflow.keras.models import load_model
+from scipy.linalg import pinv
 import matplotlib.pyplot as plt
 import pdb
 
 # TODO: a little too liberal with similar variable names between solutionROM and model
 # TODO: quite a bit changes if using primitive variables or conservative variables
 # 		This includes VTROM, and which variables are projected
+# TODO: this module is obscenely messy. Move some functions to separate file
 
 # overarching class containing all info/objects/methods required to compute ROMs
 class solutionROM:
 
-	def __init__(self, romFile, sol: solutionPhys, params: parameters):
+	def __init__(self, sol: solutionPhys, params: parameters):
 
 		# read input parameters
-		romDict = readInputFile(romFile)
+		romDict = readInputFile(params.romInputs)
 
 		# ROM methods
 		self.romMethod 		= catchInput(romDict, "romMethod", "linear") 		# accepts "linear" or "nonlinear"
 		if (self.romMethod == "nonlinear"):
+			# make sure TF doesn't gobble up device memory
+			gpus = tf.config.experimental.list_physical_devices('GPU')
+			if gpus:
+				try:
+					# Currently, memory growth needs to be the same across GPUs
+					for gpu in gpus:
+						tf.config.experimental.set_memory_growth(gpu, True)
+						logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+				except RuntimeError as e:
+					# Memory growth must be set before GPUs have been initialized
+					print(e)
 			self.encoderApprox = catchInput(romDict, "encoderApprox", False)	# whether to make encoder projection approximation
 		else:
 			self.encoderApprox = False
@@ -34,15 +47,19 @@ class solutionROM:
 		# model parameters
 		self.modelDir 		= romDict["modelDir"]		# location of all models
 		self.numModels 		= romDict["numModels"]		# number of models (trial bases/decoders) being used
-		self.modelNames 	= romDict["modelNames"] 	
+		self.modelNames 	= romDict["modelNames"] 	# single string for linear basis, list of strings for NLM
+														# FORMAT GUIDE: 
+														#	For linear: full name of NPY binary, excluding file extension (assumed *.npy)
+														# 	For NLM: all text after "decoder_"/"encoder_", excluding file extension (assumed *.h5)
 		self.latentDims 	= romDict["latentDims"]		# list of latent code dimensions for each model
 		self.modelVarIdxs 	= romDict["modelVarIdxs"]	# list of lists containing indices of variables associated with each model
 		
 		# load ROM initial conditions from disk
 		self.loadROMIC 		= catchInput(romDict, "loadROMIC", False)
 		if self.loadROMIC:
-			romIC 		= romDict["romIC"] 	# NumPy binary containing ROM initial conditions
-			self.code0	= np.load(romIC)
+			romIC 		= romDict["romIC"] 						# NumPy binary containing ROM initial conditions
+			self.code0	= np.load(romIC, allow_pickle=True)		# list of NumPy arrays
+
 			# check that IC dimensions match expected dimensions
 			try:
 				assert(len(self.code0) == self.numModels)
@@ -68,17 +85,14 @@ class solutionROM:
 		self.centProf = self.loadStandardization(romDict["centIn"])
 
 		# model/code associated with each decoder
-		self.code 			= []
-		self.decoderList 	= []
-		self.encoderList 	= []
+		self.code 		= []
+		self.modelList 	= []
 		for modelID in range(self.numModels):
 			self.code.append(np.zeros(self.latentDims[modelID]))
 			if (self.romMethod == "linear"):
-				self.decoderList.append(model(modelID, self, linearBasis=linearBasis))
+				self.modelList.append(model(modelID, self, linearBasis=linearBasis))
 			elif (self.romMethod == "nonlinear"):
-				self.decoderList.append(model(modelID, self))
-				if self.encoderApprox:
-					self.encoderList.append(model(modelID, self, encoderFlag=True))
+				self.modelList.append(model(modelID, self, encoderFlag=True))
 
 		# nonlinear models are stored in separate files, linear basis is not
 		try:
@@ -106,103 +120,82 @@ class solutionROM:
 				standProf = np.load(os.path.join(self.modelDir, dataIn))				# load normalization subtraction profile from file
 				assert(standProf.shape == solShape)
 		except:
-			print("WARNING: normSubIn load failed or not specified, defaulting to zeros...")
+			print("WARNING: standardization load failed or not specified, defaulting to zeros...")
 			standProf = np.zeros(solShape, dtype=realType)
 
 		return standProf
 
 	# initialize code and solution, if required 
-	def initializeROMState(self, sol: solutionPhys):
+	def initializeROMState(self, sol: solutionPhys, params: parameters, gas: gasProps):
 
 		if not self.loadROMIC:
 			self.mapSolToModels(sol)
 
 		for modelID in range(self.numModels):
 
-			# just compute Galerkin projection of solution
-			if (self.romMethod == "linear"):
-				
-				decoder = self.decoderList[modelID]
-				
-				# initialize from saved code
-				if self.loadROMIC:
-					decoder.code = self.code0.copy()	
-				# project onto test space
+			modelObj = self.modelList[modelID]
+
+			# initialize from saved code
+			if self.loadROMIC:
+				modelObj.code = self.code0[modelId].copy()
+
+			# compute projection of full-field initial condition
+			else:
+				if (params.timeScheme == "dualTime"):
+					modelInput = modelObj.solPrim
 				else:
-					decoder.solCons = decoder.standardizeData(decoder.solCons)
-					decoder.code = decoder.calcProjection(decoder.solCons)
+					modelInput = modelObj.solCons
+				modelInput = modelObj.standardizeData(modelInput)
+				modelObj.code = modelObj.calcEncoding(modelInput)
 
-				decoder.solCons = decoder.inferModel()
-				sol.solCons[:,decoder.varIdxs] = decoder.solCons
+			# make model inference, map to solution
+			if (params.timeScheme == "dualTime"):
+				modelObj.solPrim = modelObj.calcDecoding()
+				sol.solPrim[:,modelObj.varIdxs] = modelObj.solPrim
+			else:
+				modelObj.solCons = modelObj.calcDecoding()
+				sol.solCons[:,modelObj.varIdxs] = modelObj.solCons
 
-			elif (self.romMethod == "nonlinear"):
-				raise ValueError("Nonlinear initialization not yet implemented")
+		# finish up by initializing remainder of state
+		if (params.timeScheme == "dualTime"):
+			sol.updateState(gas)
+		else:
+			sol.updateState(gas, fromCons=True)
 
 	# project RHS onto test space(s)
 	def calcRHSProjection(self):
 
 		for modelID in range(self.numModels):
-			if self.encoderApprox:
-				raise ValueError("Encoder projection not yet implemented")
-			else:
-				modelObj = self.decoderList[modelID]
-
-			# pdb.set_trace()
+			modelObj = self.modelList[modelID]
 			modelObj.RHS = modelObj.standardizeData(modelObj.RHS, center=False)
-			# pdb.set_trace()
-			modelObj.RHSProj = modelObj.calcProjection(modelObj.RHS)
-			# pdb.set_trace()
+			modelObj.RHSProj = modelObj.calcTestProjection(modelObj.RHS)
 
 
 	# advance solution forward one subiteration
-	# TODO: right now returning dSolCons, really should just return next time step but requires input of previous time step solution
-	def advanceSubiter(self, sol: solutionPhys, params: parameters, subiter, solOuter):
+	def advanceSubiterExplicit(self, sol: solutionPhys, params: parameters, subiter, solOuter):
 
-		# if linear, can just compute change in code, don't need to decenter
-		# dSolCons = np.zeros(self.solCons.shape, dtype=realType)
 		for modelID in range(self.numModels):
-			decoder = self.decoderList[modelID]
-
-			if (self.romMethod == "linear"):
-				# dCode = params.dt * params.subIterCoeffs[subiter] * decoder.RHSProj
-				decoder.code = solOuter[modelID] + params.dt * params.subIterCoeffs[subiter] * decoder.RHSProj
-				decoder.solCons = decoder.inferModel(centering = True)
-				sol.solCons[:,decoder.varIdxs] = decoder.solCons
-				
-			# for nonlinear, need to compute next code step explicitly, decode
-			elif (self.romMethod == "nonlinear"):
-				raise ValueError("Nonlinear subiter advance not yet implemented")
-
+			modelObj = self.modelList[modelID]
+			modelObj.code = solOuter[modelID] + params.dt * params.subIterCoeffs[subiter] * modelObj.RHSProj
+			# pdb.set_trace()
+			modelObj.solCons = modelObj.calcDecoding(centering = True)
+			sol.solCons[:,modelObj.varIdxs] = modelObj.solCons
 
 	# simply returns a list containing the latent space solution
 	def getCode(self):
 
 		code = [None]*self.numModels
 		for modelID in range(self.numModels):
-			decoder = self.decoderList[modelID]
-			code[modelID] = decoder.code
+			modelObj = self.modelList[modelID]
+			code[modelID] = modelObj.code
 
 		return code
 
-	# # collect decoder inferences into sol
-	# # note: needs to map to solPrim or solCons, depending on how the model is trained
-	# def mapDecoderToSol(self):
-
-
-	# # collect encoder inferences into code
-	# def mapEncoderToCode(self):
 
 	# distribute primitive and conservative fields to models
 	def mapSolToModels(self, sol: solutionPhys):
 		for modelID in range(self.numModels):
-			if (self.romMethod == "linear"):
-				modelObj = self.decoderList[modelID]
-			
-			elif (self.romMethod == "nonlinear"): 
-				raise ValueError("Nonlinear ROM not yet implemented")
-				if self.encoderApprox:
-					raise ValueError("Encoder projection not yet implemented")
-				
+			modelObj = self.modelList[modelID]	
 			modelObj.solCons = sol.solCons[:, modelObj.varIdxs]
 			modelObj.solPrim = sol.solPrim[:, modelObj.varIdxs]
 
@@ -211,10 +204,7 @@ class solutionROM:
 	def mapRHSToModels(self, sol: solutionPhys):
 
 		for modelID in range(self.numModels):
-			if self.encoderApprox:
-				raise ValueError("Encoder projection not yet implemented")
-			else:
-				modelObj = self.decoderList[modelID]
+			modelObj = self.modelList[modelID]
 			modelObj.RHS = sol.RHS[:, modelObj.varIdxs]
 
 # encoder/decoder class
@@ -229,10 +219,17 @@ class model:
 		self.varIdxs 	= rom.modelVarIdxs[modelID]		# variable indices associated with model
 		self.numVars 	= len(self.varIdxs)				# number of prim/cons variables associated with model
 		self.numCells 	= rom.solCons.shape[0]			# number of cells in physical domain
-		self.encoderFlag = encoderFlag 						# whether or not the model is an encoder
 		self.romMethod  = rom.romMethod 				# "linear" or "nonlinear"
 		self.romProj 	= rom.romProj 					# "galerkin"
 		self.consForm 	= consForm
+
+		# encoder stuff
+		self.encoderFlag = encoderFlag 												# whether or not the model has an encoder 
+		if (self.romMethod == "nonlinear"): 
+			self.encoderApprox = rom.encoderApprox 	# whether to use encoder projection approximation 
+			self.modelJacob = np.zeros((self.numCells, self.numVars, self.latentDim), dtype=realType)
+		else:
+			self.encoderApprox = False
 
 		# separate storage for input, output, and RHS 
 		self.solCons 	= rom.solCons[:,self.varIdxs].copy()
@@ -243,119 +240,139 @@ class model:
 		self.codeN 		= np.zeros((self.latentDim,1), dtype=realType) # code from last physical time step
 		self.RHSProj 	= np.zeros((self.latentDim,1), dtype=realType) # projected RHS
 
-		# load encoder/decoder
-		# if (rom.romMethod == linear):
-		# 	modelFile = os.path.join(rom.modelDir, "lin"
-
 		# normalization/centering arrays
 		self.normSubProf 	= rom.normSubProf[:, self.varIdxs]
 		self.normFacProf 	= rom.normFacProf[:, self.varIdxs]
 		self.centProf 		= rom.centProf[:, self.varIdxs]
 
-		# storage for projection matrix
-		self.projector 		= np.zeros((self.latentDim, self.numCells, self.numVars), dtype = realType)
-
-
 		# load linear basis and truncate modes
 		# note: assumes that all bases (even scalar/separated) are stored as one concatenated basis array
 		# could probably make this more efficient by loading it into solutionROM and distributing
 		if (rom.romMethod == "linear"):
-			self.decoder 	= linearBasis[:,self.varIdxs,:self.latentDim]
+			# self.decoder 	= linearBasis[:,self.varIdxs,:self.latentDim]
+			self.decoder 	= np.reshape(linearBasis[:,self.varIdxs,:self.latentDim], (-1, self.latentDim), order='C')
 
-		# load TensorFlow model into encoder or decoder, assumed layer dimensions are in NCH format
-		# note: must be split separately as a decoder or encoder model
+		# load TensorFlow model into decoder and encoder, assumed layer dimensions are in NCH format
 		# TODO: add option to ingest full autoencoder and split, but I remember this being a pain in the ass
 		elif (rom.romMethod == "nonlinear"):
 
-			if encoderFlag:
-				modelLoc 		= os.path.join(rom.modelDir, "encoder_"+rom.modelNames[modelID]+".h5") 
-				self.encoder 	= load_model(modelLoc)
-				inputShape 		= self.encoder.layers[0].input_shape
-				outputShape 	= self.encoder.layers[-1].output_shape
-				
-				try:
-					assert(inputShape[-1] == self.numCells)
-					assert(inputShape[-2] == self.numVars)
-				except:
-					raise ValueError("Mismatched encoder input shapes: "+inputShape+", "+str(self.solCons.shape))
-				try:
-					assert(outputShape[-1] == self.latentDim)
-				except:
-					raise ValueError("Mismatched encoder output shapes: "+outputShape+", "+str(self.latentDim))
+			# load decoder
+			modelLoc 		= os.path.join(rom.modelDir, "decoder_"+rom.modelNames[modelID]+".h5")
+			self.decoder 	= load_model(modelLoc, compile=False)
 
+			inputShape 		= self.checkIOShape(self.decoder.layers[0].input_shape)
+			outputShape 	= self.checkIOShape(self.decoder.layers[-1].output_shape)
+			try:
+				assert(inputShape[-1] == self.latentDim)
+			except:
+				raise ValueError("Mismatched decoder input shapes: "+str(inputShape)+", "+str(self.latentDim))
+			try:
+				assert(outputShape[-1] == self.numCells)
+				assert(outputShape[-2] == self.numVars)
+			except:
+				raise ValueError("Mismatched decoder output shapes: "+str(outputShape)+", "+str(self.solCons.shape))
+
+			# load encoder
+			modelLoc 		= os.path.join(rom.modelDir, "encoder_"+rom.modelNames[modelID]+".h5") 
+			self.encoder 	= load_model(modelLoc, compile=False)
+
+			inputShape 		= self.checkIOShape(self.encoder.layers[0].input_shape)
+			outputShape 	= self.checkIOShape(self.encoder.layers[-1].output_shape)
+			try:
+				assert(inputShape[-1] == self.numCells)
+				assert(inputShape[-2] == self.numVars)
+			except:
+				raise ValueError("Mismatched encoder input shapes: "+str(inputShape)+", "+str(self.solCons.shape))
+			try:
+				assert(outputShape[-1] == self.latentDim)
+			except:
+				raise ValueError("Mismatched encoder output shapes: "+str(outputShape)+", "+str(self.latentDim))
+
+		# storage for projection matrix
+		if ((rom.romMethod == "linear") and (rom.romProj == "galerkin")):
+			# self.projector = np.reshape(np.transpose(self.decoder, axes=(2,0,1)), (-1,self.numCells*self.numVars), order='C')
+			self.projector = self.decoder.T
+		else:
+			self.projector = np.zeros((self.latentDim, self.numCells*self.numVars), dtype = realType)
+
+	# check model input/output shape format
+	# should be a tuple. If list, check that it only has one element and convert 
+	def checkIOShape(self, shape):
+
+		if type(shape) is list:
+			if (len(shape) != 1):
+				raise ValueError("Invalid TF model I/O size")
 			else:
-				modelLoc 		= os.path.join(rom.modelDir, "decoder_"+rom.modelNames[modelID]+".h5")
-				self.decoder 	= load_model(modelLoc)
-				inputShape 		= self.decoder.layers[0].input_shape
-				outputShape 	= self.decoder.layers[-1].output_shape
-				try:
-					assert(inputShape[-1] == self.latentDim)
-				except:
-					raise ValueError("Mismatched decoder input shapes: "+inputShape+", "+str(self.latentDim))
+				shape = shape[0]
 
-				try:
-					assert(outputShape[-1] == self.numCells)
-					assert(outputShape[-2] == self.numVars)
-				except:
-					raise ValueError("Mismatched decoder output shapes: "+outputShape+", "+str(self.solCons.shape))
+		return shape
 
-	# run model inference
-	def inferModel(self, centering=True):
 
-		# if encoder, center and normalize, run evaluation
-		if self.encoderFlag:
-			raise ValueError("Encoder inference not yet implemented")
+	# run decoder, de-normalize, and de-center
+	# TODO: add casting to same datatype as network
+	def calcDecoding(self, centering=True):
 
-		# if decoder, run evaluation, denormalize and decenter sol
+		solDecode = np.zeros(self.solShape, dtype=realType)
+
+		if (self.romMethod == "linear"):
+			solDecode = self.decoder @ self.code 
+			solDecode = np.reshape(solDecode, (self.numCells, self.numVars), order='C')
+
+		elif (self.romMethod == "nonlinear"):
+			# input expected to be in NW format
+			# output is in NCW format
+			# pdb.set_trace()
+			solDecode = np.squeeze(self.decoder.predict(self.code[None,:])).T
+
+		# de-normalize and de-center
+		solDecode = self.standardizeData(solDecode, centering, inverse=True)
+
+		return solDecode
+
+	# run "encoder" 
+	# for linear this is just Galerkin projection, for NLM it's running through the encoder
+	# assumes input has already been scaled
+	# TODO: maybe add scaling to this
+	# TODO: add casting to same datatype as network
+	def calcEncoding(self, encodeVec):
+
+		# Galerkin projection
+		if (self.romMethod == "linear"):
+			encoding = self.projector @ encodeVec.flatten(order='C')
+
+		# nonlinear encoder
 		else:
-			solDecode = np.zeros(self.solShape, dtype=realType)
+			# model input expected to be in NCW format
+			# model output is in NW format
+			encoding = np.squeeze(self.encoder.predict(encodeVec.T[None,:,:]).T)
 
-			if (self.romMethod == "linear"):
-				for varIdx in range(self.numVars):
-					solDecode[:, varIdx] = self.decoder[:,varIdx,:] @ self.code
-					# pdb.set_trace()
+		return encoding
 
-			elif (self.romMethod == "nonlinear"):
-				raise ValueError("Nonlinear manifold decoder not yet implemented")
+	# project a vector (presumably solution or RHS vector) onto test space
+	def calcTestProjection(self, projVec):
 
-			solDecode = self.standardizeData(solDecode, centering, inverse=True)
-
-			return solDecode
-
-
-	# project a vector (presumably solution or RHS vector) onto latent space
-	def calcProjection(self, projVec):
-
-		if self.encoderFlag:
-			raise ValueError("Encoder projection not yet implemented")
-
-		else:
-
-			# TODO: only do this once if it's static linear galerkin, don't need to keep reassigning it
-			if (self.romMethod == "linear"):
-				self.calcLinearProjector()
-
-			elif (self.romMethod == "nonlinear"):
-				raise ValueError("Nonlinear decoder projection not yet implemented")
-
-		# compute projection
 		proj = np.zeros(self.latentDim, dtype=realType)
-		for varIdx in range(self.numVars):
-			proj += self.projector[:,:,varIdx] @ projVec[:,varIdx]
+		if (self.romMethod == "linear"):
+			if (self.romProj == "galerkin"):
+				pass # this is constant
+			else:
+				raise ValueError("Non-Galerkin linear projection not yet implemented")
+
+
+		elif (self.romMethod == "nonlinear"):
+			if self.encoderApprox:
+				raise ValueError("Encoder projection not yet implemented")
+			else:
+				calcAnalyticalTFJacobian(self) # compute decoder Jacobian
+				self.projector = pinv(np.reshape(self.modelJacob, (-1, self.latentDim), order='C'))
+
+		# compute projection onto test space
+		proj = self.projector @ projVec.flatten(order='C')
+
+		# pdb.set_trace()
 
 		return proj
 
-	# compute projection matrix for linear model
-	def calcLinearProjector(self):
-
-		if (self.romProj == "galerkin"):
-			self.projector = np.transpose(self.decoder, axes=(2,0,1))
-
-		else:
-			raise ValueError("Invalid choice of projection method: "+self.romProj)
-
-	# # compute projection matrix for nonlinear model
-	# def calcNonlinearProjector(self):
 
 	# (de)centering and (de)normalization
 	def standardizeData(self, solArr, center=True, inverse=False):

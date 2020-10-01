@@ -10,6 +10,7 @@ import pdb
 # TODO: rename sol variable used to represent full domain state, our boundary sol name. Is confusing
 # TODO: make code general for more than two species, array broadcasts are different for 2 vs 3+ species
 #		idea: custom iterators for species-related slicing, or just squeeze any massfrac references
+# TODO: is there any way to only load TF if using nonlinear manifolds? Seems like a lot to expect everyone to have TF
 
 # read working directory input
 parser = argparse.ArgumentParser(description = "Read working directory")

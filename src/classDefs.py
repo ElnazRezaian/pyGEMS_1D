@@ -34,7 +34,7 @@ class parameters:
 		self.timeOrder 		= int(paramDict["timeOrder"])	# time integration order of accuracy (int)
 		self.solTime 		= 0.0
 
-		if (self.timeScheme in ["bdf","pTime"]):
+		if (self.timeScheme in ["bdf","dualTime"]):
 			self.timeType 		= "implicit"
 			self.numSubIters 	= catchInput(paramDict, "numSubIters", 50)	# maximum number of subiterations for iterative solver
 			self.resTol 		= catchInput(paramDict, "resTol", 1e-12)	# residual tolerance for iterative solver 
@@ -42,6 +42,8 @@ class parameters:
 			self.timeType 		= "explicit"
 			self.numSubIters 	= self.timeOrder
 			self.subIterCoeffs 	= constants.rkCoeffs[-self.timeOrder:]
+		else:
+			raise ValueError("Invalid selection of time integration scheme: "+self.timeScheme)
 
 		# spatial discretization parameters
 		self.spaceScheme 	= catchInput(paramDict, "spaceScheme", "roe")	# spatial discretization scheme (string)

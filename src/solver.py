@@ -46,8 +46,8 @@ def solver(params: parameters, geom: geometry, gas: gasProps):
 
 	# initialize ROM
 	if params.calcROM: 
-		rom = solutionROM(params.romInputs, sol, params)
-		rom.initializeROMState(sol)
+		rom = solutionROM(sol, params)
+		rom.initializeROMState(sol, params, gas)
 	else:
 		rom = None
 

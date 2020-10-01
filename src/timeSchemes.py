@@ -69,7 +69,7 @@ def advanceExplicit(sol: solutionPhys, rom: solutionROM,
 	if (params.calcROM):
 		rom.mapRHSToModels(sol)
 		rom.calcRHSProjection()
-		rom.advanceSubiter(sol, params, subiter, solOuter)
+		rom.advanceSubiterExplicit(sol, params, subiter, solOuter)
 	else:
 		dSol = params.dt * params.subIterCoeffs[subiter] * sol.RHS
 		sol.solCons = solOuter + dSol
