@@ -84,6 +84,25 @@ class solutionROM:
 		self.normFacProf = self.loadStandardization(romDict["normFacIn"])
 		self.centProf = self.loadStandardization(romDict["centIn"])
 
+		# nonlinear models are stored in separate files, linear basis is not
+		try:
+			assert(len(self.latentDims) == self.numModels)
+		except:
+			raise AssertionError("Incorrect number of latent dimension entries")
+
+		if (self.romMethod == "nonlinear"): 
+			try:
+				assert(len(self.modelNames) == self.numModels)
+			except AssertionError as ex:
+				print("Incorrect number of model names or latent dimensions")
+				raise ex
+		elif (self.romMethod == "linear"):
+			try:
+				assert(type(self.modelNames) == str)
+			except AssertionError as ex:
+				print("modelNames must be a string path to the linear basis file")
+				raise ex
+
 		# model/code associated with each decoder
 		self.code 		= []
 		self.modelList 	= []
@@ -94,30 +113,19 @@ class solutionROM:
 			elif (self.romMethod == "nonlinear"):
 				self.modelList.append(model(modelID, self, encoderFlag=True))
 
-		# nonlinear models are stored in separate files, linear basis is not
-		try:
-			assert(len(self.latentDims) == self.numModels)
-		except:
-			raise AssertionError("Incorrect number of latent dimension entries")
-
-		try:
-			if (self.romMethod == "nonlinear"):
-				assert(len(self.modelNames) == self.numModels)
-			elif (self.romMethod == "linear"):
-				assert(type(self.modelNames) == str)
-		except:
-			raise AssertionError("Incorrect number/type of model names")
-
 
 	def loadStandardization(self, dataIn):
 		solShape = self.solPrim.shape
 		try:
+			# load constant standardization values from user input
 			if (type(dataIn) == list):
 				assert(len(dataIn) == solShape[-1])
-				standVals = np.array(dataIn, dtype=realType)		# load normalization subtraction values from user input
+				standVals = np.array(dataIn, dtype=realType)				
 				standProf = np.ones(solShape, dtype=realType) * standVals
+			
+			# load single complete standardization profile from file
 			elif (type(dataIn) == str):
-				standProf = np.load(os.path.join(self.modelDir, dataIn))				# load normalization subtraction profile from file
+				standProf = np.load(os.path.join(self.modelDir, dataIn))				
 				assert(standProf.shape == solShape)
 		except:
 			print("WARNING: standardization load failed or not specified, defaulting to zeros...")
@@ -177,7 +185,6 @@ class solutionROM:
 		for modelID in range(self.numModels):
 			modelObj = self.modelList[modelID]
 			modelObj.code = solOuter[modelID] + params.dt * params.subIterCoeffs[subiter] * modelObj.RHSProj
-			# pdb.set_trace()
 			modelObj.solCons = modelObj.calcDecoding(centering = True)
 			sol.solCons[:,modelObj.varIdxs] = modelObj.solCons
 
@@ -321,8 +328,7 @@ class model:
 		elif (self.romMethod == "nonlinear"):
 			# input expected to be in NW format
 			# output is in NCW format
-			# pdb.set_trace()
-			solDecode = np.squeeze(self.decoder.predict(self.code[None,:])).T
+			solDecode = np.squeeze(self.decoder.predict(self.code[None,:]), axis=0).T
 
 		# de-normalize and de-center
 		solDecode = self.standardizeData(solDecode, centering, inverse=True)
@@ -368,8 +374,6 @@ class model:
 
 		# compute projection onto test space
 		proj = self.projector @ projVec.flatten(order='C')
-
-		# pdb.set_trace()
 
 		return proj
 

@@ -437,7 +437,7 @@ def calcAnalyticalTFJacobian(modelObj, encoder = False, dtype = constants.realTy
 			outputs = modelObj.decoder(inputs)
 
 		# output of model is in CW order, Jacobian is thus CWK, reorder to WCK 
-		modelObj.modelJacob = np.transpose(np.squeeze(g.jacobian(outputs, inputs).numpy()), axes=(1,0,2))
+		modelObj.modelJacob = np.transpose(np.squeeze(g.jacobian(outputs, inputs).numpy(), axis=(0,3)), axes=(1,0,2))
 
 # compute numerical gradients of TensorFlow-Keras models
 # TODO: add casting to same dtype as network
