@@ -1,4 +1,5 @@
-from perform.rom.linearProjROM.linearProjROM import linearProjROM
+from pygems1d.rom.linearProjROM.linearProjROM import linearProjROM
+from pygems1d.rom.ModelAdaption.adapt import adapt
 
 
 import numpy as np
@@ -12,13 +13,16 @@ class linearGalerkinProj(linearProjROM):
 	Trial basis is assumed to represent the conserved variables (see SPLSVT for primitive variable representation)
 	"""
 
-	def __init__(self, modelIdx, romDomain, solver, solDomain):
+	def __init__(self, modelIdx, romDomain, solver):
 
-		super().__init__(modelIdx, romDomain, solver, solDomain)
+		super().__init__(modelIdx, romDomain, solver)
 
 		self.testBasis = self.trialBasis
 
 		self.calcProjector(romDomain, runCalc=True)
+
+		if romDomain.adaptiveROM: self.adapt = adapt(self, solver, romDomain)
+
 
 
 	def decodeSol(self, code):
@@ -66,35 +70,20 @@ class linearGalerkinProj(linearProjROM):
 				self.projector = self.trialBasis.T @ self.hyperReducBasis @ np.linalg.pinv(self.hyperReducBasis[self.directHyperReducSampIdxs,:])
 
 			else:
-				# V^T
-				self.projector = self.trialBasis.T
+				if romDomain.adaptiveROM and romDomain.adaptionMethod == "OSAB":
+					# V^{+}
+					self.projector = np.linalg.pinv(self.trialBasis)
+				else:
+					# V^T
+					self.projector = self.trialBasis.T
+
 		else:
 			pass
-
-
-	def calcDCode(self, resJacob, res):
-		"""
-		Compute change in low-dimensional state for implicit scheme Newton iteration
-		"""
-
-		# calculate test basis
-		# TODO: this is not valid for scalar POD, another reason to switch to C ordering of resJacob
-		self.testBasis = (resJacob.toarray() / self.normFacProfCons.ravel(order="F")[:,None]) @ self.trialBasisFScaled
-
-		# compute W^T * W
-		LHS = self.testBasis.T @ self.testBasis
-		RHS = -self.testBasis.T @ res.ravel(order="F")
-
-		# linear solve
-		dCode = np.linalg.solve(LHS, RHS)
-		pdb.set_trace()
-		
-		return dCode, LHS, RHS
 
 
 	def updateSol(self, solDomain):
 		"""
 		Update conservative solution after code has been updated
 		"""
-
 		solDomain.solInt.solCons[self.varIdxs,:] = self.decodeSol(self.code)
+

@@ -1,13 +1,13 @@
-from perform.constants import realType
-from perform.rom.romModel import romModel
-from perform.inputFuncs import catchInput
+from pygems1d.constants import realType
+from pygems1d.rom.romModel import romModel
+from pygems1d.inputFuncs import catchInput
 
 import numpy as np
 import pdb
 
 class linearProjROM(romModel):
 
-	def __init__(self, modelIdx, romDomain, solver, solDomain):
+	def __init__(self, modelIdx, romDomain, solver):
 
 		super().__init__(modelIdx, romDomain, solver)
 
@@ -22,18 +22,18 @@ class linearProjROM(romModel):
 			" modes (" + str(numModesBasisIn) + " < " + str(self.latentDim) + ")")
 
 		# flatten first two dimensions for easier matmul
-		self.trialBasis = self.trialBasis[self.varIdxs,:,:self.latentDim]
+		self.trialBasis = self.trialBasis[:,:,:self.latentDim]
 		self.trialBasis = np.reshape(self.trialBasis, (-1, self.latentDim), order='C')
 
 		# load and check gappy POD basis
 		if romDomain.hyperReduc:
 			hyperReducBasis = np.load(romDomain.hyperReducFiles[self.modelIdx])
 			assert (hyperReducBasis.ndim == 3), "Hyper-reduction basis must have three axes"
-			assert (hyperReducBasis.shape[:2] == (solDomain.gasModel.numEqs, solver.mesh.numCells)), \
+			assert (hyperReducBasis.shape[:2] == (solver.gasModel.numEqs, solver.mesh.numCells)), \
 				"Hyper reduction basis must have shape [numEqs, numCells, numHRModes]"
 
 			self.hyperReducDim = romDomain.hyperReducDims[self.modelIdx]
-			hyperReducBasis = hyperReducBasis[self.varIdxs,:,:self.hyperReducDim]
+			hyperReducBasis = hyperReducBasis[:,:,:self.hyperReducDim]
 			self.hyperReducBasis = np.reshape(hyperReducBasis, (-1, self.hyperReducDim), order="C")
 
 			# indices for sampling flattened hyperReducBasis
@@ -60,7 +60,7 @@ class linearProjROM(romModel):
 		Assumed that fullDimArr is either 1D array or is in [numVars, numCells] order
 		Assumed that projector is already in [numModes, numVars x numCells] order
 		"""
-		
+
 		if (fullDimArr.ndim == 2):
 			fullDimVec = fullDimArr.flatten(order="C")
 		elif (fullDimArr.ndim == 1):
@@ -90,3 +90,25 @@ class linearProjROM(romModel):
 		# calc projection operator and project
 		self.calcProjector(romDomain, romDomain.adaptiveROM)
 		self.rhsLowDim = self.projectToLowDim(self.projector, rhsScaled, transpose=False)
+
+	def adaptionSubIteration(self, romDomain, solDomain):
+
+		if romDomain.timeIntegrator.timeType =="implicit" :
+			raise ValueError ("Implicit framework for model adaptation not implemented yet")
+
+		else:
+			if self.adapt.adaptionMethod == "OSAB":
+				if romDomain.hyperReduc: raise ValueError ("OSAB currently not DEIM friendly")
+				rhs   = solDomain.solInt.RHS[self.varIdxs[:,None], solDomain.directSampIdxs[None,:]]
+				dcode = romDomain.timeIntegrator.solveSolChange(rhs)
+				solDomain.solInt.solCons[self.varIdxs, :] = solDomain.solInt.solHistCons[0][self.varIdxs, :] + dcode
+				if romDomain.timeIntegrator.subiter == romDomain.timeIntegrator.subiterMax:
+					solCons = self.standardizeData(solDomain.solInt.solCons[self.varIdxs, :], normalize=True,
+												   normFacProf=self.normFacProfCons, normSubProf=self.normSubProfCons,
+												   center=True, centProf=self.centProfCons, inverse=False)
+					self.adapt.trueStandardizedState = solCons
+					self.calcProjector(romDomain, romDomain.adaptiveROM)
+					self.code = self.projectToLowDim(self.projector, solCons, transpose=False)
+
+
+

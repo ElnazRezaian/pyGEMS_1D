@@ -1,4 +1,4 @@
-from perform.constants import realType
+from pygems1d.constants import realType
 
 import numpy as np
 import pdb

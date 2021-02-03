@@ -1,11 +1,11 @@
 
-from perform.inputFuncs import readInputFile, catchList, catchInput
-from perform.rom.linearProjROM.linearGalerkinProj import linearGalerkinProj
-from perform.timeIntegrator.explicitIntegrator import rkExplicit
-from perform.timeIntegrator.implicitIntegrator import bdf
-from perform.solution.solutionPhys import solutionPhys
-from perform.spaceSchemes import calcRHS
-from perform.Jacobians import calcDResDSolPrim
+from pygems1d.inputFuncs import readInputFile, catchList, catchInput
+from pygems1d.rom.linearProjROM.linearGalerkinProj import linearGalerkinProj
+# from pygems1d.rom.linearProjROM.linearSPLSVTProj import linearSPLSVTProj
+from pygems1d.timeIntegrator.explicitIntegrator import rkExplicit
+from pygems1d.timeIntegrator.implicitIntegrator import bdf
+from pygems1d.spaceSchemes import calcRHS
+from pygems1d.Jacobians import calcDResDSolPrim
 
 import numpy as np
 from time import sleep
@@ -41,6 +41,7 @@ class romDomain:
 			assert (len(self.latentDims) == 1), "Must provide only one value of latentDims when numModels = 1"
 			assert (self.latentDims[0] > 0), "latentDims must contain positive integers"
 		else:
+
 			if (len(self.latentDims) == self.numModels):
 				pass
 			elif (len(self.latentDims) == 1):	
@@ -59,9 +60,10 @@ class romDomain:
 			modelVarSum += len(modelVarIdxs[modelIdx])
 			for modelVarIdx in modelVarIdxs[modelIdx]:
 				assert (modelVarIdx >= 0), "modelVarIdxs must be non-negative integers"
-				assert (modelVarIdx < solDomain.gasModel.numEqs), "modelVarIdxs must less than the number of governing equations"
-		assert (modelVarSum == solDomain.gasModel.numEqs), ("Must specify as many modelVarIdxs entries as governing equations (" +
-														str(modelVarSum) + " != " + str(solDomain.gasModel.numEqs) + ")")
+				assert (modelVarIdx < solver.gasModel.numEqs), "modelVarIdxs must less than the number of governing equations"
+		assert (modelVarSum == solver.gasModel.numEqs), ("Must specify as many modelVarIdxs entries as governing equations (" +
+														str(modelVarSum) + " != " + str(solver.gasModel.numEqs) + ")")
+
 		modelVarIdxsOneList = sum(modelVarIdxs, [])
 		assert (len(modelVarIdxsOneList) == len(set(modelVarIdxsOneList))), "All entries in modelVarIdxs must be unique"
 		self.modelVarIdxs = modelVarIdxs 
@@ -89,7 +91,14 @@ class romDomain:
 
 		self.setModelFlags()
 
+		#ROM adaption
 		self.adaptiveROM = catchInput(romDict, "adaptiveROM", False)
+		if self.adaptiveROM:
+			self.adaptionMethod     = catchInput(romDict, "adaptionMethod", "OSAB")
+			assert(self.adaptionMethod == "OSAB"), "Invalid Entry for adaption method"
+			self.adaptionParameters = romDict["adaptionParameters"]
+			#TODO: add assert for parameters (each adaptive case)
+
 
 		# set up hyper-reduction, if necessary
 		self.hyperReduc = catchInput(romDict, "hyperReduc", False)
@@ -101,11 +110,11 @@ class romDomain:
 		for modelIdx in range(self.numModels):
 
 			if (self.romMethod == "linearGalerkinProj"):
-				self.modelList[modelIdx] = linearGalerkinProj(modelIdx, self, solver, solDomain)
+				self.modelList[modelIdx] = linearGalerkinProj(modelIdx, self, solver)
 			elif (self.romMethod == "linearLSPGProj"):
 				raise ValueError("linearLSPGProj ROM not implemented yet")
 			elif (self.romMethod == "linearSPLSVTProj"):
-				raise ValueError("linearSPLSVTProj ROM not implemented yet")
+				self.modelList[modelIdx] = linearSPLSVTProj(modelIdx, self, solver)
 			elif (self.romMethod == "autoencoderGalerkinProjTF"):
 				raise ValueError("autoencoderGalerkinProjTF ROM not implemented yet")
 			elif (self.romMethod == "autoencoderLSPGProjTF"):
@@ -125,7 +134,7 @@ class romDomain:
 			else:
 				self.modelList[modelIdx].initFromSol(solDomain, solver)
 		
-		solDomain.solInt.updateState(fromCons=self.targetCons)
+		solDomain.solInt.updateState(solver.gasModel, fromCons=self.targetCons)
 
 		# get time integrator, if necessary
 		# TODO: move this selection to an external function? This is repeated in solutionDomain
@@ -244,13 +253,6 @@ class romDomain:
 
 
 	def loadHyperReduc(self, solDomain, solver):
-		"""
-		Loads direct sampling indices and determines cell indices for calculating fluxes and gradients
-		"""
-
-		raise ValueError("Hyper-reduction temporarily out of commission for development")
-
-		# TODO: add some explanations for what each index array accomplishes
 
 		# load and check sample points
 		sampFile = catchInput(self.romDict, "sampFile", "")
@@ -284,11 +286,6 @@ class romDomain:
 		solDomain.fluxSampRIdxs = np.unique(solDomain.fluxSampRIdxs)
 		solDomain.numFluxFaces  = len(solDomain.fluxSampLIdxs)
 
-		# Roe average
-		if (solver.spaceScheme == "roe"):
-			zerosProf        = np.zeros((solDomain.gasModel.numEqs, solDomain.numFluxFaces), dtype=const.realType)
-			solDomain.solAve = solutionPhys(solDomain, zerosProf, zerosProf, solDomain.numFluxFaces, solver)
-
 		# to slice flux when calculating RHS
 		solDomain.fluxRHSIdxs = np.zeros(solDomain.numSampCells, np.int32)
 		for i in range(1,solDomain.numSampCells):
@@ -298,33 +295,8 @@ class romDomain:
 				solDomain.fluxRHSIdxs[i] = solDomain.fluxRHSIdxs[i-1] + 2
 
 		# compute indices for gradient calculations
-		# NOTE: also need to account for prepended/appended boundary cells
-		# TODO: generalize for higher-order schemes
 		if (solver.spaceOrder > 1):
-			if (solver.spaceOrder == 2):
-				solDomain.gradIdxs = np.concatenate((solDomain.directSampIdxs+1, solDomain.directSampIdxs, solDomain.directSampIdxs+2))
-				solDomain.gradIdxs = np.unique(solDomain.gradIdxs)
-				# exclude left neighbor of inlet, right neighbor of outlet
-				if (solDomain.gradIdxs[0] == 0): solDomain.gradIdxs = solDomain.gradIdxs[1:]
-				if (solDomain.gradIdxs[-1] == (solver.mesh.numCells+1)):  solDomain.gradIdxs = solDomain.gradIdxs[:-1]
-				solDomain.numGradCells = len(solDomain.gradIdxs)
-
-				# neighbors of gradient cells
-				solDomain.gradNeighIdxs = np.concatenate((solDomain.gradIdxs-1, solDomain.gradIdxs+1))
-				solDomain.gradNeighIdxs = np.unique(solDomain.gradNeighIdxs)
-				# exclude left neighbor of inlet, right neighbor of outlet
-				if (solDomain.gradNeighIdxs[0] == -1): solDomain.gradNeighIdxs = solDomain.gradNeighIdxs[1:]
-				if (solDomain.gradNeighIdxs[-1] == (solver.mesh.numCells+2)):  solDomain.gradNeighIdxs = solDomain.gradNeighIdxs[:-1]
-
-				# indices of gradIdxs in gradNeighIdxs
-				_, _, solDomain.gradNeighExtract = np.intersect1d(solDomain.gradIdxs, solDomain.gradNeighIdxs, return_indices=True)
-
-				# indices of gradIdxs in fluxSampLIdxs and fluxSampRIdxs, and vice versa
-				_, solDomain.gradLExtract, solDomain.fluxLExtract = np.intersect1d(solDomain.gradIdxs, solDomain.fluxSampLIdxs, return_indices=True)
-				_, solDomain.gradRExtract, solDomain.fluxRExtract = np.intersect1d(solDomain.gradIdxs, solDomain.fluxSampRIdxs, return_indices=True)
-
-			else:
-				raise ValueError("Sampling for higher-order schemes not implemented yet")
+			raise ValueError("Sampling for higher-order schemes not implemented yet")
 
 		# copy indices for ease of use
 		self.numSampCells = solDomain.numSampCells
@@ -339,21 +311,7 @@ class romDomain:
 			assert (os.path.isfile(inFile)), "Could not find hyper-reduction file at " + inFile
 			self.hyperReducFiles[modelIdx] = inFile
 
-		# load hyper reduction dimensions and check validity
 		self.hyperReducDims = catchList(self.romDict, "hyperReducDims", [0], lenHighest=self.numModels)
-		for i in self.hyperReducDims: assert (i > 0), "hyperReducDims must contain positive integers"
-		if (self.numModels == 1):
-			assert (len(self.hyperReducDims) == 1), "Must provide only one value of hyperReducDims when numModels = 1"
-			assert (self.hyperReducDims[0] > 0), "hyperReducDims must contain positive integers"
-		else:
-			if (len(self.hyperReducDims) == self.numModels):
-				pass
-			elif (len(self.hyperReducDims) == 1):	
-				print("Only one value provided in hyperReducDims, applying to all models")
-				sleep(1.0)
-				self.hyperReducDims = [self.hyperReducDims[0]] * self.numModels
-			else:
-				raise ValueError("Must provide either numModels or 1 entry in hyperReducDims")
 
 
 	def advanceIter(self, solDomain, solver):
@@ -371,12 +329,15 @@ class romDomain:
 		else:
 		
 			for self.timeIntegrator.subiter in range(1, self.timeIntegrator.subiterMax+1):
+			# for self.timeIntegrator.subiter in range(1):
 
 				self.advanceSubiter(solDomain, solver)
 				
 				if (self.timeIntegrator.timeType == "implicit"):
 					solDomain.solInt.calcResNorms(solver, self.timeIntegrator.subiter)
 					if (solDomain.solInt.resNormL2 < self.timeIntegrator.resTol): break
+			if self.adaptiveROM:
+				for modelIdx, model in enumerate(self.modelList):	model.adapt.adaptModel(self, solDomain, solver, model)
 
 		solDomain.solInt.updateSolHist()
 		self.updateCodeHist()
@@ -388,41 +349,39 @@ class romDomain:
 		"""
 
 		solInt = solDomain.solInt
-		res, resJacob = None, None
 
 		if self.isIntrusive:
 			calcRHS(solDomain, solver)
 
 		if (self.timeIntegrator.timeType == "implicit"):
 
-			raise ValueError("Implicit ROM under development")
+			raise ValueError("Implicit ROM not implemented yet")
+			# if self.isIntrusive:
+			# 	res = self.timeIntegrator.calcResidual(solInt.solHistCons, solInt.RHS, solver)
+			# 	resJacob = calcDResDSolPrim(solDomain, solver) 	# TODO: new Jacobians, state update for non-dual time 
 
-			if self.isIntrusive:
-				res = self.timeIntegrator.calcResidual(solInt.solHistCons, solInt.RHS, solver)
-				resJacob = calcDResDSolPrim(solDomain, solver)
-
-			for modelIdx, model in enumerate(self.modelList):
-				dCode = model.calcDCode(resJacob, res)
-				model.code += dCode
-				model.codeHist[0] = model.code.copy()
-				model.updateSol(solDomain)
+			# for modelIdx, model in enumerate(self.modelList):
+			# 	dCode, LHS, RHS = model.calcDSol(resJacob, res)
+			# 	model.code += dCode
+			# 	model.codeHist[0] = model.code.copy()
+			# 	model.updateSol(solDomain)
 				
-			dSol = solInt.solPrim - solInt.solHistPrim[0]
-			res = resJacob @ dSol.ravel("F") - solInt.res.ravel("F")
-			solInt.res = np.reshape(res, (solDomain.gasModel.numEqs, solver.mesh.numCells), order='F')
+			# dSol = solInt.solPrim - solInt.solHistPrim[0]
+			# res = resJacob @ dSol.ravel("F") - solInt.res.ravel("F")
+			# solInt.res = np.reshape(res, (solver.gasModel.numEqs, solver.mesh.numCells), order='F')
 
-			solInt.updateState(fromCons=False) 	
+			# solInt.updateState(solver.gasModel, fromCons=False) 	# TODO: not valid for all models
 
 		else:
-
 			for modelIdx, model in enumerate(self.modelList):
-
-				model.calcRHSLowDim(self, solDomain)
-				dCode = self.timeIntegrator.solveSolChange(model.rhsLowDim)
-				model.code = model.codeHist[0] + dCode
-				model.updateSol(solDomain)
-			
-			solInt.updateState(fromCons=True)
+				if (self.adaptiveROM and model.adapt.subIteration):
+					model.adaptionSubIteration(self, solDomain)
+				else:
+					model.calcRHSLowDim(self, solDomain)
+					dCode = self.timeIntegrator.solveSolChange(model.rhsLowDim)
+					model.code = model.codeHist[0] + dCode
+					model.updateSol(solDomain)
+			solInt.updateState(solver.gasModel, fromCons=True)
 
 	def updateCodeHist(self):
 		"""
